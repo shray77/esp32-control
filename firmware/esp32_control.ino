@@ -28,6 +28,11 @@
 #include <Adafruit_NeoPixel.h>
 #include <ESP32Servo.h>
 #include <ArduinoJson.h>
+#include <SPIFFS.h>
+#include <AudioOutputI2S.h>
+#include <AudioFileSourceSPIFFS.h>
+#include <AudioGeneratorWAV.h>
+#include <AudioGeneratorMP3.h>
 
 // ─── Configuration ──────────────────────────────────────────────────────
 
@@ -69,6 +74,15 @@ int ledBrightness = 80;           // 0-255
 int animationSpeed = 50;          // ms delay between frames
 unsigned long lastAnimationUpdate = 0;
 int animationStep = 0;
+
+// ─── Audio (internal DAC on GPIO25/GPIO26) ──────────────────────────────
+AudioOutputI2S* audioOut = nullptr;
+AudioFileSourceSPIFFS* audioFile = nullptr;
+AudioGeneratorWAV* wavPlayer = nullptr;
+AudioGeneratorMP3* mp3Player = nullptr;
+String currentAudioFile = "";
+bool audioPlaying = false;
+const int AUDIO_MAX_FILES = 20;
 
 // ─── Embedded web page (PROGMEM) ────────────────────────────────────────
 
@@ -319,6 +333,39 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   .servo-viz .center-dot { fill: #fff; }
   .servo-viz .label { fill: var(--text-dim); font-size: 11px; font-weight: 600; }
 
+  /* Sync card */
+  .sync-card {
+    grid-column: 1 / -1;
+    background: linear-gradient(135deg, rgba(168,85,247,0.08), rgba(236,72,153,0.08));
+    border-color: rgba(168,85,247,0.25);
+  }
+  .sync-card .card-title { color: #fff; }
+  .sync-presets {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+    margin-top: 14px;
+  }
+  .sync-preset {
+    padding: 14px 4px;
+    font-size: 1rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, rgba(168,85,247,0.2), rgba(236,72,153,0.2));
+    border: 1px solid rgba(168,85,247,0.4);
+    color: #fff;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    box-shadow: 0 4px 12px rgba(168,85,247,0.15);
+  }
+  .sync-preset:hover {
+    background: linear-gradient(135deg, rgba(168,85,247,0.35), rgba(236,72,153,0.35));
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(168,85,247,0.4);
+  }
+  .sync-preset:active { transform: translateY(0); }
+  .sync-slider-row { margin-top: 16px; }
+
   /* LED card */
   .led-card { grid-column: 1 / -1; }
   .led-grid {
@@ -444,6 +491,130 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   }
   .info-row:last-child { border-bottom: none; }
   .info-row span:last-child { color: var(--text); font-weight: 600; }
+
+  /* Audio card */
+  .audio-card { grid-column: 1 / -1; }
+  .audio-grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
+  @media (min-width: 768px) { .audio-grid { grid-template-columns: 1fr 1fr; } }
+
+  .tts-row { display: flex; gap: 8px; margin-bottom: 10px; }
+  .tts-input {
+    flex: 1;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid var(--glass-bd);
+    color: var(--text);
+    padding: 10px 12px;
+    border-radius: 10px;
+    font-size: 0.85rem;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .tts-input:focus { border-color: var(--accent); }
+  .tts-input::placeholder { color: var(--text-dim); }
+
+  .btn {
+    background: linear-gradient(135deg, #a855f7, #ec4899);
+    color: #fff;
+    border: none;
+    padding: 10px 16px;
+    border-radius: 10px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(168,85,247,0.4); }
+  .btn:active { transform: translateY(0); }
+  .btn-secondary {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid var(--glass-bd);
+    color: var(--text);
+  }
+  .btn-secondary:hover { background: rgba(168,85,247,0.15); border-color: rgba(168,85,247,0.4); }
+
+  .phrase-list, .file-list {
+    margin-top: 8px;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .phrase-item, .file-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--glass-bd);
+    border-radius: 8px;
+    margin-bottom: 6px;
+    transition: all 0.15s;
+  }
+  .phrase-item:hover, .file-item:hover {
+    background: rgba(168,85,247,0.08);
+    border-color: rgba(168,85,247,0.3);
+  }
+  .phrase-text, .file-name {
+    flex: 1;
+    font-size: 0.82rem;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .phrase-actions, .file-actions { display: flex; gap: 4px; }
+  .icon-btn {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid var(--glass-bd);
+    color: var(--text);
+    width: 30px;
+    height: 30px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85rem;
+    transition: all 0.15s;
+  }
+  .icon-btn:hover { background: rgba(168,85,247,0.2); border-color: var(--accent); }
+  .icon-btn.danger:hover { background: rgba(239,68,68,0.2); border-color: var(--danger); }
+
+  .upload-row { display: flex; gap: 8px; align-items: center; }
+  .upload-label {
+    flex: 1;
+    background: rgba(255,255,255,0.05);
+    border: 1px dashed var(--glass-bd);
+    color: var(--text-dim);
+    padding: 12px;
+    border-radius: 10px;
+    text-align: center;
+    cursor: pointer;
+    font-size: 0.85rem;
+    transition: all 0.15s;
+  }
+  .upload-label:hover { border-color: var(--accent); color: var(--text); }
+  .upload-label input { display: none; }
+
+  .section-title {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 8px;
+    margin-top: 4px;
+  }
+  .empty-state {
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    text-align: center;
+    padding: 16px;
+    font-style: italic;
+  }
 </style>
 </head>
 <body>
@@ -545,6 +716,30 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     </div>
   </div>
 
+  <!-- Sync Control (Оба серво одновременно) -->
+  <div class="card sync-card">
+    <div class="card-header">
+      <div>
+        <div class="card-title"><span class="icon">🔗</span> Оба серво одновременно</div>
+        <div class="card-subtitle">Синхронное управление · GPIO2 + GPIO3</div>
+      </div>
+    </div>
+    <div class="slider-label">
+      <span>Угол обоих сервоприводов</span>
+      <span class="value" id="val-sync">90°</span>
+    </div>
+    <div class="sync-slider-row">
+      <input type="range" id="slider-sync" min="0" max="180" value="90">
+    </div>
+    <div class="sync-presets">
+      <button class="sync-preset" data-sync-angle="0">0°</button>
+      <button class="sync-preset" data-sync-angle="45">45°</button>
+      <button class="sync-preset" data-sync-angle="90">90°</button>
+      <button class="sync-preset" data-sync-angle="135">135°</button>
+      <button class="sync-preset" data-sync-angle="180">180°</button>
+    </div>
+  </div>
+
   <!-- LED Control -->
   <div class="card led-card">
     <div class="card-header">
@@ -599,6 +794,55 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     </div>
   </div>
 
+  <!-- Audio Card -->
+  <div class="card audio-card">
+    <div class="card-header">
+      <div>
+        <div class="card-title"><span class="icon">🔊</span> Аудио</div>
+        <div class="card-subtitle">TTS · Загрузка файлов · GPIO25/26 (DAC)</div>
+      </div>
+      <button class="icon-btn" id="btn-stop-audio" title="Стоп">⏹</button>
+    </div>
+
+    <div class="audio-grid">
+      <!-- TTS + Saved Phrases -->
+      <div>
+        <div class="section-title">Озвучить текст (браузер)</div>
+        <div class="tts-row">
+          <input type="text" class="tts-input" id="tts-input" placeholder="Введите текст для озвучивания...">
+          <button class="btn" id="btn-speak">🔊 Сказать</button>
+        </div>
+        <div style="display:flex; gap:8px; margin-bottom:12px;">
+          <button class="btn btn-secondary" id="btn-save-phrase" style="flex:1;">💾 Сохранить фразу</button>
+          <select id="tts-voice" class="tts-input" style="max-width:140px;"></select>
+        </div>
+
+        <div class="section-title">Сохранённые фразы</div>
+        <div class="phrase-list" id="phrase-list">
+          <div class="empty-state">Нет сохранённых фраз</div>
+        </div>
+      </div>
+
+      <!-- File Upload + ESP Playback -->
+      <div>
+        <div class="section-title">Загрузить аудиофайл на ESP32</div>
+        <div class="upload-row">
+          <label class="upload-label" for="file-upload">
+            📁 Выбрать WAV/MP3 файл
+            <input type="file" id="file-upload" accept=".wav,.mp3">
+          </label>
+          <button class="btn" id="btn-upload" disabled style="opacity:0.5;">⬆ Загрузить</button>
+        </div>
+        <div id="upload-status" style="font-size:0.78rem; color:var(--text-dim); margin-top:6px; min-height:18px;"></div>
+
+        <div class="section-title" style="margin-top:14px;">Файлы на ESP32</div>
+        <div class="file-list" id="file-list">
+          <div class="empty-state">Нет загруженных файлов</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- System info -->
   <div class="card led-card">
     <div class="card-header">
@@ -609,6 +853,8 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="info-row"><span>Uptime</span><span id="info-uptime">—</span></div>
     <div class="info-row"><span>LEDs</span><span>14 (2×7)</span></div>
     <div class="info-row"><span>Servos</span><span>2× SG90</span></div>
+    <div class="info-row"><span>Audio</span><span>DAC GPIO25/26</span></div>
+    <div class="info-row"><span>Storage</span><span id="info-storage">—</span></div>
   </div>
 
 </div>
@@ -640,6 +886,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       document.getElementById('overlay').classList.remove('show');
       document.getElementById('info-ws').textContent = 'connected';
       sendCmd({ cmd: 'get_state' });
+      sendCmd({ cmd: 'list_files' });
       showToast('✓ Подключено');
     };
 
@@ -658,6 +905,13 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'state') applyState(msg);
+        else if (msg.type === 'file_list') renderFiles(msg.files);
+        else if (msg.type === 'audio_state') {
+          if (msg.playing === false && msg.reason) showToast(`Аудио: ${msg.reason}`);
+        }
+        else if (msg.type === 'storage_info') {
+          document.getElementById('info-storage').textContent = msg.used;
+        }
       } catch (err) {
         console.error('Parse error:', err);
       }
@@ -777,6 +1031,45 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     });
   });
 
+  // Sync slider — двигает оба серво одновременно
+  let syncThrottle = 0;
+  document.getElementById('slider-sync').addEventListener('input', (e) => {
+    const angle = parseInt(e.target.value);
+    document.getElementById('val-sync').textContent = angle + '°';
+    // Обновляем UI обоих серво
+    document.getElementById('slider-servo1').value = angle;
+    document.getElementById('val-servo1').textContent = angle + '°';
+    updateServoViz(1, angle);
+    document.getElementById('slider-servo2').value = angle;
+    document.getElementById('val-servo2').textContent = angle + '°';
+    updateServoViz(2, angle);
+    // Throttle 80ms
+    if (Date.now() - syncThrottle > 80) {
+      sendCmd({ cmd: 'servo_both', angle });
+      syncThrottle = Date.now();
+    }
+  });
+  document.getElementById('slider-sync').addEventListener('change', (e) => {
+    sendCmd({ cmd: 'servo_both', angle: parseInt(e.target.value) });
+  });
+
+  // Sync preset buttons — мгновенно ставят оба серво в один угол
+  document.querySelectorAll('.sync-preset').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const angle = parseInt(btn.dataset.syncAngle);
+      document.getElementById('slider-sync').value = angle;
+      document.getElementById('val-sync').textContent = angle + '°';
+      document.getElementById('slider-servo1').value = angle;
+      document.getElementById('val-servo1').textContent = angle + '°';
+      updateServoViz(1, angle);
+      document.getElementById('slider-servo2').value = angle;
+      document.getElementById('val-servo2').textContent = angle + '°';
+      updateServoViz(2, angle);
+      sendCmd({ cmd: 'servo_both', angle });
+      showToast(`Оба серво → ${angle}°`);
+    });
+  });
+
   // Color picker
   let colorThrottle = 0;
   document.getElementById('color-picker').addEventListener('input', (e) => {
@@ -820,6 +1113,207 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     showToast._t = setTimeout(() => toast.classList.remove('show'), 1500);
   }
 
+  // ─── AUDIO: TTS (browser) ───────────────────────────────────────────
+  let voices = [];
+  function loadVoices() {
+    voices = window.speechSynthesis.getVoices();
+    const select = document.getElementById('tts-voice');
+    select.innerHTML = '';
+    // Сначала русские голоса
+    const ru = voices.filter(v => v.lang.startsWith('ru'));
+    const other = voices.filter(v => !v.lang.startsWith('ru'));
+    [...ru, ...other].forEach((v, i) => {
+      const opt = document.createElement('option');
+      opt.value = voices.indexOf(v);
+      opt.textContent = `${v.name} (${v.lang})`;
+      select.appendChild(opt);
+    });
+    // По умолчанию первый русский
+    const ruIdx = voices.findIndex(v => v.lang.startsWith('ru'));
+    if (ruIdx >= 0) select.value = ruIdx;
+  }
+  if ('speechSynthesis' in window) {
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+  }
+
+  function speakText(text) {
+    if (!text || !('speechSynthesis' in window)) return;
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'ru-RU';
+    const sel = document.getElementById('tts-voice');
+    if (sel.value) {
+      const v = voices[parseInt(sel.value)];
+      if (v) u.voice = v;
+    }
+    u.rate = 1.0;
+    u.pitch = 1.0;
+    window.speechSynthesis.speak(u);
+  }
+
+  document.getElementById('btn-speak').addEventListener('click', () => {
+    const text = document.getElementById('tts-input').value.trim();
+    if (!text) { showToast('Введите текст'); return; }
+    speakText(text);
+    showToast('🔊 Озвучиваю...');
+  });
+  document.getElementById('tts-input').addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') document.getElementById('btn-speak').click();
+  });
+
+  // ─── AUDIO: Saved phrases (localStorage) ────────────────────────────
+  function loadPhrases() {
+    try { return JSON.parse(localStorage.getItem('esp32_phrases') || '[]'); }
+    catch (e) { return []; }
+  }
+  function savePhrases(arr) {
+    localStorage.setItem('esp32_phrases', JSON.stringify(arr));
+  }
+  function renderPhrases() {
+    const list = document.getElementById('phrase-list');
+    const phrases = loadPhrases();
+    if (phrases.length === 0) {
+      list.innerHTML = '<div class="empty-state">Нет сохранённых фраз</div>';
+      return;
+    }
+    list.innerHTML = '';
+    phrases.forEach((p, i) => {
+      const item = document.createElement('div');
+      item.className = 'phrase-item';
+      item.innerHTML = `
+        <span class="phrase-text" title="${p}">${p}</span>
+        <div class="phrase-actions">
+          <button class="icon-btn" data-action="speak" data-idx="${i}" title="Сказать">▶</button>
+          <button class="icon-btn danger" data-action="delete" data-idx="${i}" title="Удалить">🗑</button>
+        </div>`;
+      list.appendChild(item);
+    });
+    list.querySelectorAll('button[data-action]').forEach(b => {
+      b.addEventListener('click', () => {
+        const idx = parseInt(b.dataset.idx);
+        const phrases = loadPhrases();
+        if (b.dataset.action === 'speak') {
+          speakText(phrases[idx]);
+        } else if (b.dataset.action === 'delete') {
+          phrases.splice(idx, 1);
+          savePhrases(phrases);
+          renderPhrases();
+          showToast('Удалено');
+        }
+      });
+    });
+  }
+  document.getElementById('btn-save-phrase').addEventListener('click', () => {
+    const text = document.getElementById('tts-input').value.trim();
+    if (!text) { showToast('Введите текст сначала'); return; }
+    const phrases = loadPhrases();
+    phrases.push(text);
+    savePhrases(phrases);
+    renderPhrases();
+    showToast('💾 Сохранено');
+  });
+  renderPhrases();
+
+  // ─── AUDIO: File upload ─────────────────────────────────────────────
+  let selectedFile = null;
+  document.getElementById('file-upload').addEventListener('change', (e) => {
+    selectedFile = e.target.files[0];
+    const btn = document.getElementById('btn-upload');
+    if (selectedFile) {
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      document.getElementById('upload-status').textContent =
+        `📄 ${selectedFile.name} (${(selectedFile.size/1024).toFixed(1)} KB)`;
+    } else {
+      btn.disabled = true;
+      btn.style.opacity = '0.5';
+      document.getElementById('upload-status').textContent = '';
+    }
+  });
+  document.getElementById('btn-upload').addEventListener('click', async () => {
+    if (!selectedFile) return;
+    const status = document.getElementById('upload-status');
+    const btn = document.getElementById('btn-upload');
+    btn.disabled = true;
+    btn.textContent = '⏳ Загрузка...';
+    status.textContent = 'Загрузка...';
+    try {
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+      const resp = await fetch('/upload', { method: 'POST', body: formData });
+      if (resp.ok) {
+        const data = await resp.json();
+        status.textContent = `✅ ${data.message || 'Загружено'}`;
+        showToast('Файл загружен на ESP32');
+        sendCmd({ cmd: 'list_files' });
+        selectedFile = null;
+        document.getElementById('file-upload').value = '';
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
+      } else {
+        status.textContent = `❌ Ошибка: ${resp.status}`;
+      }
+    } catch (err) {
+      status.textContent = `❌ ${err.message}`;
+    }
+    btn.textContent = '⬆ Загрузить';
+  });
+
+  // ─── AUDIO: ESP32 file list & playback ──────────────────────────────
+  function renderFiles(files) {
+    const list = document.getElementById('file-list');
+    if (!files || files.length === 0) {
+      list.innerHTML = '<div class="empty-state">Нет загруженных файлов</div>';
+      return;
+    }
+    list.innerHTML = '';
+    files.forEach(f => {
+      const item = document.createElement('div');
+      item.className = 'file-item';
+      const sizeStr = f.size < 1024 ? `${f.size} B` : `${(f.size/1024).toFixed(1)} KB`;
+      item.innerHTML = `
+        <span class="file-name" title="${f.name}">🎵 ${f.name} (${sizeStr})</span>
+        <div class="file-actions">
+          <button class="icon-btn" data-action="play" data-name="${f.name}" title="Воспроизвести">▶</button>
+          <button class="icon-btn danger" data-action="delete" data-name="${f.name}" title="Удалить">🗑</button>
+        </div>`;
+      list.appendChild(item);
+    });
+    list.querySelectorAll('button[data-action]').forEach(b => {
+      b.addEventListener('click', () => {
+        const name = b.dataset.name;
+        if (b.dataset.action === 'play') {
+          sendCmd({ cmd: 'play_file', name });
+          showToast(`▶ ${name}`);
+        } else if (b.dataset.action === 'delete') {
+          sendCmd({ cmd: 'delete_file', name });
+          showToast(`🗑 ${name}`);
+        }
+      });
+    });
+  }
+
+  document.getElementById('btn-stop-audio').addEventListener('click', () => {
+    sendCmd({ cmd: 'stop_audio' });
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    showToast('⏹ Стоп');
+  });
+
+  // Handle audio_state messages from ESP
+  const origOnMessage = ws ? ws.onmessage : null;
+  function handleAudioMessage(msg) {
+    if (msg.type === 'file_list') {
+      renderFiles(msg.files);
+    } else if (msg.type === 'audio_state') {
+      if (msg.playing === false && msg.reason) {
+        showToast(`Аудио: ${msg.reason}`);
+      }
+    } else if (msg.type === 'storage_info') {
+      document.getElementById('info-storage').textContent = msg.used;
+    }
+  }
+
   // Uptime
   setInterval(() => {
     const sec = Math.floor((Date.now() - startTime) / 1000);
@@ -838,7 +1332,6 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </script>
 </body>
 </html>
-
 )HTML";
 
 // ─── Servo helpers ──────────────────────────────────────────────────────
@@ -1042,6 +1535,14 @@ void broadcastState() {
   webSocket.broadcastTXT(response);
 }
 
+// Forward declarations (для аудио-функций, определяемых ниже)
+void stopAudio();
+void playAudioFile(const String& name, uint8_t clientNum);
+void sendFileList(uint8_t clientNum);
+void sendAudioState(uint8_t clientNum, bool playing, const char* reason);
+void sendStorageInfo(uint8_t clientNum);
+void updateAudioLoop();
+
 void handleWebSocketMessage(uint8_t clientNum, const char* payload) {
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, payload);
@@ -1062,6 +1563,14 @@ void handleWebSocketMessage(uint8_t clientNum, const char* payload) {
     int angle = doc["angle"] | -1;
     if (which > 0 && angle >= 0) {
       setServo(which, angle);
+    }
+    return;
+  }
+  if (cmd == "servo_both") {
+    int angle = doc["angle"] | -1;
+    if (angle >= 0) {
+      setServo(1, angle);
+      setServo(2, angle);
     }
     return;
   }
@@ -1092,6 +1601,170 @@ void handleWebSocketMessage(uint8_t clientNum, const char* payload) {
     animationSpeed = constrain((int)doc["value"] | 50, 10, 500);
     return;
   }
+  // ─── Audio commands ────────────────────────────────────────────────
+  if (cmd == "play_file") {
+    String name = doc["name"] | "";
+    if (name.length() > 0) {
+      playAudioFile(name, clientNum);
+    }
+    return;
+  }
+  if (cmd == "stop_audio") {
+    stopAudio();
+    return;
+  }
+  if (cmd == "list_files") {
+    sendFileList(clientNum);
+    return;
+  }
+  if (cmd == "delete_file") {
+    String name = doc["name"] | "";
+    if (name.length() > 0) {
+      String path = "/" + name;
+      if (SPIFFS.remove(path)) {
+        sendFileList(clientNum);
+        sendStorageInfo(clientNum);
+      }
+    }
+    return;
+  }
+}
+
+// ─── Audio playback functions ───────────────────────────────────────────
+
+void stopAudio() {
+  if (wavPlayer) { wavPlayer->stop(); }
+  if (mp3Player) { mp3Player->stop(); }
+  audioPlaying = false;
+  currentAudioFile = "";
+}
+
+void playAudioFile(const String& name, uint8_t clientNum) {
+  // Stop current playback
+  stopAudio();
+
+  String path = "/" + name;
+  if (!SPIFFS.exists(path)) {
+    sendAudioState(clientNum, false, "файл не найден");
+    return;
+  }
+
+  // Determine format by extension
+  String lowerName = name;
+  lowerName.toLowerCase();
+
+  audioFile = new AudioFileSourceSPIFFS(path.c_str());
+  if (!audioFile || !(*audioFile)) {
+    sendAudioState(clientNum, false, "не удалось открыть");
+    delete audioFile;
+    audioFile = nullptr;
+    return;
+  }
+
+  if (lowerName.endsWith(".wav")) {
+    wavPlayer = new AudioGeneratorWAV();
+    if (wavPlayer->begin(audioFile, audioOut)) {
+      audioPlaying = true;
+      currentAudioFile = name;
+      Serial.printf("[Audio] Playing WAV: %s\n", path.c_str());
+    } else {
+      sendAudioState(clientNum, false, "WAV decode failed");
+      delete wavPlayer; wavPlayer = nullptr;
+      delete audioFile; audioFile = nullptr;
+    }
+  } else if (lowerName.endsWith(".mp3")) {
+    mp3Player = new AudioGeneratorMP3();
+    if (mp3Player->begin(audioFile, audioOut)) {
+      audioPlaying = true;
+      currentAudioFile = name;
+      Serial.printf("[Audio] Playing MP3: %s\n", path.c_str());
+    } else {
+      sendAudioState(clientNum, false, "MP3 decode failed");
+      delete mp3Player; mp3Player = nullptr;
+      delete audioFile; audioFile = nullptr;
+    }
+  } else {
+    sendAudioState(clientNum, false, "только WAV/MP3");
+    delete audioFile; audioFile = nullptr;
+  }
+}
+
+void sendFileList(uint8_t clientNum) {
+  StaticJsonDocument<4096> doc;
+  doc["type"] = "file_list";
+  JsonArray files = doc.createNestedArray("files");
+
+  File root = SPIFFS.open("/");
+  File file = root.openNextFile();
+  int count = 0;
+  while (file && count < AUDIO_MAX_FILES) {
+    String fname = file.name();
+    // Skip hidden files
+    if (!fname.startsWith(".")) {
+      JsonObject f = files.createNestedObject();
+      f["name"] = fname;
+      f["size"] = (int)file.size();
+      count++;
+    }
+    file = root.openNextFile();
+  }
+  String response;
+  serializeJson(doc, response);
+  webSocket.sendTXT(clientNum, response);
+}
+
+void sendAudioState(uint8_t clientNum, bool playing, const char* reason) {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "audio_state";
+  doc["playing"] = playing;
+  if (reason) doc["reason"] = reason;
+  String response;
+  serializeJson(doc, response);
+  webSocket.sendTXT(clientNum, response);
+}
+
+void sendStorageInfo(uint8_t clientNum) {
+  StaticJsonDocument<256> doc;
+  doc["type"] = "storage_info";
+  FSInfo info;
+  if (SPIFFS.info(info)) {
+    int usedKB = (info.usedBytes) / 1024;
+    int totalKB = info.totalBytes / 1024;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%d KB / %d KB", usedKB, totalKB);
+    doc["used"] = String(buf);
+  } else {
+    doc["used"] = "—";
+  }
+  String response;
+  serializeJson(doc, response);
+  webSocket.sendTXT(clientNum, response);
+}
+
+void updateAudioLoop() {
+  if (!audioPlaying) return;
+  if (wavPlayer && wavPlayer->isRunning()) {
+    if (!wavPlayer->loop()) {
+      wavPlayer->stop();
+      delete wavPlayer; wavPlayer = nullptr;
+      delete audioFile; audioFile = nullptr;
+      audioPlaying = false;
+      currentAudioFile = "";
+      // Broadcast stop
+      sendAudioState(0, false, "завершено");
+    }
+  } else if (mp3Player && mp3Player->isRunning()) {
+    if (!mp3Player->loop()) {
+      mp3Player->stop();
+      delete mp3Player; mp3Player = nullptr;
+      delete audioFile; audioFile = nullptr;
+      audioPlaying = false;
+      currentAudioFile = "";
+      sendAudioState(0, false, "завершено");
+    }
+  } else {
+    audioPlaying = false;
+  }
 }
 
 void onWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t* payload, size_t length) {
@@ -1102,6 +1775,7 @@ void onWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t* payload, size_t
     case WStype_CONNECTED:
       Serial.printf("[%u] Connected\n", clientNum);
       sendState(clientNum);
+      sendStorageInfo(clientNum);
       break;
     case WStype_TEXT:
       handleWebSocketMessage(clientNum, (const char*)payload);
@@ -1122,6 +1796,26 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println(F("\n=== ESP32 Control Hub ==="));
+
+  // SPIFFS init (для хранения аудиофайлов)
+  if (!SPIFFS.begin(true)) {
+    Serial.println(F("⚠ SPIFFS mount failed — форматирование..."));
+    SPIFFS.format();
+    SPIFFS.begin(true);
+  }
+  FSInfo fsInfo;
+  if (SPIFFS.info(fsInfo)) {
+    Serial.printf("SPIFFS: %u KB total, %u KB used\n",
+                  fsInfo.totalBytes / 1024, fsInfo.usedBytes / 1024);
+  }
+  Serial.println(F("SPIFFS initialized"));
+
+  // Audio init — внутренний DAC на GPIO25/26
+  audioOut = new AudioOutputI2S();
+  audioOut->SetPinout(0, 0, 0);  // не используется для внутреннего DAC
+  // Включаем внутренний DAC (вместо внешнего I2S)
+  audioOut->SetGain(0.5);  // 50% громкость (0.0 - 1.0)
+  Serial.println(F("Audio DAC initialized on GPIO25/26"));
 
   // LEDs init
   strip.begin();
@@ -1162,6 +1856,52 @@ void setup() {
     json += "}";
     req->send(200, "application/json", json);
   });
+
+  // File upload endpoint
+  server.on("/upload", HTTP_POST,
+    [](AsyncWebServerRequest* req) {
+      // Response sent after body processed
+      AsyncWebServerResponse* resp = req->beginResponse(200, "application/json",
+        "{\"ok\":true,\"message\":\"Файл загружен\"}");
+      req->send(resp);
+    },
+    [](AsyncWebServerRequest* req, const String& filename, size_t index,
+       uint8_t* data, size_t len, bool final) {
+      // Sanitize filename — remove path, keep only filename
+      String safeName = filename;
+      int lastSlash = safeName.lastIndexOf('/');
+      if (lastSlash >= 0) safeName = safeName.substring(lastSlash + 1);
+      int lastBackslash = safeName.lastIndexOf('\\');
+      if (lastBackslash >= 0) safeName = safeName.substring(lastBackslash + 1);
+
+      String path = "/" + safeName;
+
+      if (!index) {
+        // First chunk — open file for writing
+        Serial.printf("[Upload] Start: %s (%u bytes)\n", path.c_str(), req->contentLength());
+        // Remove if exists
+        if (SPIFFS.exists(path)) SPIFFS.remove(path);
+        File f = SPIFFS.open(path, "w");
+        if (!f) {
+          Serial.println("[Upload] Failed to open file for writing");
+          return;
+        }
+        f.close();
+      }
+
+      // Write chunk
+      File f = SPIFFS.open(path, "a");
+      if (f) {
+        f.write(data, len);
+        f.close();
+      }
+
+      if (final) {
+        Serial.printf("[Upload] Done: %s\n", path.c_str());
+      }
+    }
+  );
+
   server.onNotFound([](AsyncWebServerRequest* req) {
     req->send(404, "text/plain", "Not Found");
   });
@@ -1184,6 +1924,7 @@ void setup() {
 void loop() {
   webSocket.loop();
   updateAnimation();
+  updateAudioLoop();
   // Small yield to keep WiFi happy
   if (animationSpeed > 50) {
     delay(1);
