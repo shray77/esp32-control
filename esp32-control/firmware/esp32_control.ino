@@ -1535,6 +1535,14 @@ void broadcastState() {
   webSocket.broadcastTXT(response);
 }
 
+// Forward declarations (для аудио-функций, определяемых ниже)
+void stopAudio();
+void playAudioFile(const String& name, uint8_t clientNum);
+void sendFileList(uint8_t clientNum);
+void sendAudioState(uint8_t clientNum, bool playing, const char* reason);
+void sendStorageInfo(uint8_t clientNum);
+void updateAudioLoop();
+
 void handleWebSocketMessage(uint8_t clientNum, const char* payload) {
   StaticJsonDocument<512> doc;
   DeserializationError error = deserializeJson(doc, payload);
