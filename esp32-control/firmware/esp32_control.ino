@@ -319,6 +319,39 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   .servo-viz .center-dot { fill: #fff; }
   .servo-viz .label { fill: var(--text-dim); font-size: 11px; font-weight: 600; }
 
+  /* Sync card */
+  .sync-card {
+    grid-column: 1 / -1;
+    background: linear-gradient(135deg, rgba(168,85,247,0.08), rgba(236,72,153,0.08));
+    border-color: rgba(168,85,247,0.25);
+  }
+  .sync-card .card-title { color: #fff; }
+  .sync-presets {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+    margin-top: 14px;
+  }
+  .sync-preset {
+    padding: 14px 4px;
+    font-size: 1rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, rgba(168,85,247,0.2), rgba(236,72,153,0.2));
+    border: 1px solid rgba(168,85,247,0.4);
+    color: #fff;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    box-shadow: 0 4px 12px rgba(168,85,247,0.15);
+  }
+  .sync-preset:hover {
+    background: linear-gradient(135deg, rgba(168,85,247,0.35), rgba(236,72,153,0.35));
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(168,85,247,0.4);
+  }
+  .sync-preset:active { transform: translateY(0); }
+  .sync-slider-row { margin-top: 16px; }
+
   /* LED card */
   .led-card { grid-column: 1 / -1; }
   .led-grid {
@@ -542,6 +575,30 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       <button class="preset" data-servo="2" data-angle="90">90°</button>
       <button class="preset" data-servo="2" data-angle="135">135°</button>
       <button class="preset" data-servo="2" data-angle="180">180°</button>
+    </div>
+  </div>
+
+  <!-- Sync Control (Оба серво одновременно) -->
+  <div class="card sync-card">
+    <div class="card-header">
+      <div>
+        <div class="card-title"><span class="icon">🔗</span> Оба серво одновременно</div>
+        <div class="card-subtitle">Синхронное управление · GPIO2 + GPIO3</div>
+      </div>
+    </div>
+    <div class="slider-label">
+      <span>Угол обоих сервоприводов</span>
+      <span class="value" id="val-sync">90°</span>
+    </div>
+    <div class="sync-slider-row">
+      <input type="range" id="slider-sync" min="0" max="180" value="90">
+    </div>
+    <div class="sync-presets">
+      <button class="sync-preset" data-sync-angle="0">0°</button>
+      <button class="sync-preset" data-sync-angle="45">45°</button>
+      <button class="sync-preset" data-sync-angle="90">90°</button>
+      <button class="sync-preset" data-sync-angle="135">135°</button>
+      <button class="sync-preset" data-sync-angle="180">180°</button>
     </div>
   </div>
 
@@ -774,6 +831,45 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       document.getElementById('val-servo' + which).textContent = angle + '°';
       updateServoViz(which, angle);
       sendCmd({ cmd: 'servo', which, angle });
+    });
+  });
+
+  // Sync slider — двигает оба серво одновременно
+  let syncThrottle = 0;
+  document.getElementById('slider-sync').addEventListener('input', (e) => {
+    const angle = parseInt(e.target.value);
+    document.getElementById('val-sync').textContent = angle + '°';
+    // Обновляем UI обоих серво
+    document.getElementById('slider-servo1').value = angle;
+    document.getElementById('val-servo1').textContent = angle + '°';
+    updateServoViz(1, angle);
+    document.getElementById('slider-servo2').value = angle;
+    document.getElementById('val-servo2').textContent = angle + '°';
+    updateServoViz(2, angle);
+    // Throttle 80ms
+    if (Date.now() - syncThrottle > 80) {
+      sendCmd({ cmd: 'servo_both', angle });
+      syncThrottle = Date.now();
+    }
+  });
+  document.getElementById('slider-sync').addEventListener('change', (e) => {
+    sendCmd({ cmd: 'servo_both', angle: parseInt(e.target.value) });
+  });
+
+  // Sync preset buttons — мгновенно ставят оба серво в один угол
+  document.querySelectorAll('.sync-preset').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const angle = parseInt(btn.dataset.syncAngle);
+      document.getElementById('slider-sync').value = angle;
+      document.getElementById('val-sync').textContent = angle + '°';
+      document.getElementById('slider-servo1').value = angle;
+      document.getElementById('val-servo1').textContent = angle + '°';
+      updateServoViz(1, angle);
+      document.getElementById('slider-servo2').value = angle;
+      document.getElementById('val-servo2').textContent = angle + '°';
+      updateServoViz(2, angle);
+      sendCmd({ cmd: 'servo_both', angle });
+      showToast(`Оба серво → ${angle}°`);
     });
   });
 
@@ -1062,6 +1158,14 @@ void handleWebSocketMessage(uint8_t clientNum, const char* payload) {
     int angle = doc["angle"] | -1;
     if (which > 0 && angle >= 0) {
       setServo(which, angle);
+    }
+    return;
+  }
+  if (cmd == "servo_both") {
+    int angle = doc["angle"] | -1;
+    if (angle >= 0) {
+      setServo(1, angle);
+      setServo(2, angle);
     }
     return;
   }
